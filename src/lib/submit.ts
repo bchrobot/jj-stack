@@ -584,54 +584,58 @@ export async function executeSubmissionPlan(
   };
 
   try {
-    // Push all bookmarks that need pushing
-    for (const bookmark of plan.bookmarksNeedingPush) {
-      try {
-        callbacks?.onPushStarted?.(bookmark, plan.remoteName);
-        await jj.pushBookmark(bookmark.name, plan.remoteName);
-        callbacks?.onPushCompleted?.(bookmark, plan.remoteName);
-        result.pushedBookmarks.push(bookmark);
-      } catch (error) {
-        throw new Error(`Error pushing ${bookmark.name}: ${String(error)}`);
-      }
-    }
-
     const bookmarkToPR = new Map<string, PullRequest>(plan.existingPRs);
 
-    // Update PR bases for existing PRs that need it (in order from bottom to top)
-    for (const {
-      bookmark,
-      currentBaseBranch,
-      expectedBaseBranchOptions,
-      pr,
-    } of plan.bookmarksNeedingPRBaseUpdate) {
-      try {
-        if (expectedBaseBranchOptions.length !== 1) {
+    // CRITICAL: Interleave push and base update operations to prevent indirect merges
+    // Process bookmarks from bottom to top of stack
+    // For each bookmark: push first, then immediately update its PR base if needed
+    for (const bookmark of plan.bookmarksToSubmit) {
+      // Step 1: Push the bookmark if needed
+      if (plan.bookmarksNeedingPush.some((b) => b.name === bookmark.name)) {
+        try {
+          callbacks?.onPushStarted?.(bookmark, plan.remoteName);
+          await jj.pushBookmark(bookmark.name, plan.remoteName);
+          callbacks?.onPushCompleted?.(bookmark, plan.remoteName);
+          result.pushedBookmarks.push(bookmark);
+        } catch (error) {
+          throw new Error(`Error pushing ${bookmark.name}: ${String(error)}`);
+        }
+      }
+
+      // Step 2: Immediately update PR base for this bookmark if needed
+      const baseUpdate = plan.bookmarksNeedingPRBaseUpdate.find(
+        (u) => u.bookmark.name === bookmark.name,
+      );
+      if (baseUpdate) {
+        try {
+          if (baseUpdate.expectedBaseBranchOptions.length !== 1) {
+            throw new Error(
+              `Expected exactly one base branch option for ${bookmark.name}, but got ${baseUpdate.expectedBaseBranchOptions.length}`,
+            );
+          }
+
+          callbacks?.onPRBaseUpdateStarted?.(
+            bookmark,
+            baseUpdate.currentBaseBranch,
+            baseUpdate.expectedBaseBranchOptions[0],
+          );
+
+          const updatedPR = await updatePRBase(
+            githubConfig.octokit,
+            githubConfig.owner,
+            githubConfig.repo,
+            baseUpdate.pr.number,
+            baseUpdate.expectedBaseBranchOptions[0],
+          );
+
+          callbacks?.onPRBaseUpdateCompleted?.(bookmark, updatedPR);
+          result.updatedPRs.push({ bookmark, pr: updatedPR });
+          bookmarkToPR.set(bookmark.name, updatedPR);
+        } catch (error) {
           throw new Error(
-            `Expected exactly one base branch option for ${bookmark.name}, but got ${expectedBaseBranchOptions.length}`,
+            `Error updating PR base for ${bookmark.name}: ${String(error)}`,
           );
         }
-
-        callbacks?.onPRBaseUpdateStarted?.(
-          bookmark,
-          currentBaseBranch,
-          expectedBaseBranchOptions[0],
-        );
-
-        const updatedPR = await updatePRBase(
-          githubConfig.octokit,
-          githubConfig.owner,
-          githubConfig.repo,
-          pr.number,
-          expectedBaseBranchOptions[0],
-        );
-
-        callbacks?.onPRBaseUpdateCompleted?.(bookmark, updatedPR);
-        result.updatedPRs.push({ bookmark, pr: updatedPR });
-      } catch (error) {
-        throw new Error(
-          `Error updating PR base for ${bookmark.name}: ${String(error)}`,
-        );
       }
     }
 
